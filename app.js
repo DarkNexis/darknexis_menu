@@ -102,9 +102,26 @@ function migrateState(d){
   if(!('seedVersion' in d)) d.seedVersion = null;
   for(const day in d.menu){
     const ds = d.menu[day];
-    if(ds && ds.slots) SLOT_IDS.forEach(sl => (ds.slots[sl]||[]).forEach(e => { if(e && !e.t) e.t = 'r'; }));
+    if(ds && ds.slots) SLOT_IDS.forEach(sl => {
+      /* чиним старые дубли: одно блюдо в одном приёме пищи - одна строка
+         с количеством порций, а не несколько одинаковых */
+      const out = [];
+      (ds.slots[sl]||[]).forEach(e => {
+        if(!e) return;
+        if(!e.t) e.t = 'r';
+        const twin = out.find(x => x.t === e.t && (x.t === 'c' ? x.name === e.name : x.n === e.n));
+        if(twin) stackDishes(twin, e); else out.push(e);
+      });
+      ds.slots[sl] = out;
+    });
   }
   return d;
+}
+/* сложить две записи одного блюда: у растёт количество порций (у своих блюд - штук) */
+function stackDishes(target, extra){
+  if(target.t === 'c') target.qty = Math.min(20, (target.qty||1) + (extra.qty||1));
+  else target.p = Math.min(8, Math.round(((target.p||1) + (extra.p||1)) * 2) / 2);
+  return target;
 }
 /* подтянуть обновления сборника: новые карточки добавляем, неизменённые -
    берём свежую версию, правленные пользователем не трогаем */
@@ -371,12 +388,14 @@ function stockDot(prod){
 }
 function modalFootHTML(num, fav, cooked){
   const inShop = (S.shopExtra || []).some(x => x.num === num);
+  const inToday = menuHasDish(todayDayId(), num);
   return '<button class="btn '+(fav?'btn-soft':'btn-ghost')+'" data-action="fav" data-num="'+num+'">'+I('heart',15)+(fav?'В избранном':'В избранное')+'</button>' +
     '<button class="btn btn-ghost" data-action="cooked" data-num="'+num+'">'+I('chef',15)+'Я готовил'+(cooked?NBSP+'×'+cooked:'')+'</button>' +
+    '<button class="btn '+(inToday?'btn-soft':'btn-ghost')+'" data-action="to-menu-today" data-num="'+num+'" title="'+(inToday?'Уже в сегодняшнем меню - добавление увеличит количество порций':'Добавить в сегодняшнее меню - выберешь приём пищи')+'">'+I('calendar',15)+'В меню на сегодня</button>' +
     (cooked ? '<button class="btn-linklike" data-action="cooked-reset" data-num="'+num+'" title="Обнулить счётчик">обнулить</button>' : '') +
     '<button class="btn '+(inShop?'btn-soft':'btn-ghost')+'" data-action="to-shop" data-num="'+num+'" title="'+(inShop?'Убрать карточку из списка покупок':'Добавить ингредиенты карточки в покупки')+'">'+I('cart',15)+(inShop?'В покупках':'В покупки')+'</button>' +
     '<button class="btn btn-ghost" data-action="edit-recipe" data-num="'+num+'">'+I('pencil',15)+'Править</button>' +
-    '<button class="btn btn-primary" data-action="to-menu" data-num="'+num+'" style="margin-left:auto">'+I('calendar',15)+'В меню</button>';
+    '<button class="btn btn-primary" data-action="to-menu" data-num="'+num+'" style="margin-left:auto" title="Выбрать день недели и приём пищи">'+I('calendar',15)+'В меню…</button>';
 }
 function openRecipeModal(num){
   const r = REC_BY_NUM[num]; if(!r) return;
@@ -754,46 +773,73 @@ function openPicker(day, slot){
 function renderPicker(q){
   if(!PICK_CTX) return;
   $('#pickSub').textContent = DAY_NAMES[DAY_IDS.indexOf(PICK_CTX.day)] + ', ' + SLOT_NAMES[SLOT_IDS.indexOf(PICK_CTX.slot)].toLowerCase();
+  const slotArr = (S.menu[PICK_CTX.day] && S.menu[PICK_CTX.day].slots && S.menu[PICK_CTX.day].slots[PICK_CTX.slot]) || [];
+  const inSlot = {};
+  slotArr.forEach(x => { if(x && x.t === 'r') inSlot[x.n] = (inSlot[x.n]||0) + (x.p||1); });
   q = (q||'').toLowerCase();
   const list = RECIPES.filter(r => !q || (r.title + ' ' + r.num + ' ' + r.tags.join(' ')).toLowerCase().includes(q));
   $('#pickList').innerHTML = list.map(r => {
     const b = BOOK[r.book] || {color:'var(--terra)', bg:'var(--terra-soft)'};
     const added = PICK_CTX.added[r.num];
+    const has = inSlot[r.num] || 0;
     return '<div class="pick-row" data-action="pick" data-num="'+r.num+'" style="'+(added?'opacity:.5':'')+'">' +
       '<span class="pick-num" style="color:'+b.color+';background:'+b.bg+'">'+r.num+'</span>' +
-      '<span class="pt"><span class="t1">'+esc(r.title)+'</span><span class="t2">'+esc(shortPortions(r.portionsText))+DOT+r.timeTotal+NBSP+'мин'+(added?DOT+'добавлено':'')+'</span></span>' +
+      '<span class="pt"><span class="t1">'+esc(r.title)+'</span><span class="t2">'+esc(shortPortions(r.portionsText))+DOT+r.timeTotal+NBSP+'мин'+(has?DOT+'уже в меню'+(has>1?' ×'+has:''):'')+(added?DOT+'добавлено':'')+'</span></span>' +
       '<span class="pk">'+fmtN(r.kbju.k)+'</span></div>';
   }).join('') || '<div class="empty" style="padding:30px"><div class="t serif">Не нашлось</div></div>';
 }
 
 /* ---------- ВЫБОР СЛОТА (из карточки) ---------- */
-function openSlotChooser(num, portP){
+/* preset = 'today' - заголовок «в сегодняшнее меню» (сегодня предвыбран и так,
+   и при обычном «В меню…» - день меняется одним тапом) */
+function openSlotChooser(num, portP, preset){
+  const r = REC_BY_NUM[num];
+  window.__pickDay = todayDayId();
+  window.__pickSlot = null;
   openModal('<div class="panel small" style="max-width:430px">' +
-    '<div class="panel-head"><div class="htxt"><div class="panel-title">Добавить в меню</div><div class="panel-sub">'+esc(REC_BY_NUM[num].title)+(portP ? DOT + portP + NBSP + pluralPort(portP) : '')+'</div></div><button class="close-x" data-action="close">'+I('x',17)+'</button></div>' +
-    '<div class="panel-body" style="padding:16px 20px">' +
+    '<div class="panel-head"><div class="htxt"><div class="panel-title">'+(preset === 'today' ? 'Добавить в сегодняшнее меню' : 'Добавить в меню')+'</div><div class="panel-sub">'+esc(r ? r.title : num)+(portP ? DOT + portP + NBSP + pluralPort(portP) : '')+'</div></div><button class="close-x" data-action="close">'+I('x',17)+'</button></div>' +
+    '<div class="panel-body" style="padding:16px 20px 10px">' +
       '<div class="sect-h">День</div><div class="slots" style="grid-template-columns:repeat(4,1fr)">' +
-        DAY_IDS.map((d,i) => '<button class="btn btn-ghost day-pick" data-action="pick-day" data-day="'+d+'" style="justify-content:center">'+DAY_NAMES[i]+'</button>').join('') +
+        DAY_IDS.map((d,i) => '<button class="btn btn-ghost day-pick'+(d === window.__pickDay ? ' btn-primary' : '')+'" data-action="pick-day" data-day="'+d+'" style="justify-content:center">'+DAY_NAMES[i]+'</button>').join('') +
       '</div>' +
       '<div class="sect-h">Приём пищи</div><div class="slots" style="grid-template-columns:1fr 1fr">' +
         SLOT_IDS.map((s,i) => '<button class="btn btn-ghost slot-pick" data-action="pick-slot" data-slot="'+s+'" style="justify-content:center">'+SLOT_NAMES[i]+'</button>').join('') +
       '</div>' +
+      '<div class="set-hint">Если блюдо уже стоит в выбранном приёме пищи - добавление увеличит количество порций, дубликат не появится.</div>' +
     '</div>' +
     '<div class="panel-foot"><button class="btn btn-primary" data-action="pick-confirm" data-num="'+num+'" data-p="'+(portP||'')+'" style="margin-left:auto">Добавить</button><span id="pickChoice" class="kbju-line" style="color:var(--muted)"></span></div></div>', {center:true});
-  window.__pickDay = null; window.__pickSlot = null;
   const ov = modalStack[modalStack.length-1];
+  function updatePickChoice(){
+    const el = $('#pickChoice');
+    if(el) el.textContent = (window.__pickDay ? DAY_NAMES[DAY_IDS.indexOf(window.__pickDay)] : '') + (window.__pickSlot ? ', ' + SLOT_NAMES[SLOT_IDS.indexOf(window.__pickSlot)].toLowerCase() : '');
+  }
   ov.addEventListener('click', e => {
     const d = e.target.closest('[data-action="pick-day"]');
     const s = e.target.closest('[data-action="pick-slot"]');
-    if(d){ window.__pickDay = d.dataset.day; $$('.day-pick').forEach(x => x.classList.remove('btn-primary')); d.classList.add('btn-primary'); updatePickChoice(); }
-    if(s){ window.__pickSlot = s.dataset.slot; $$('.slot-pick').forEach(x => x.classList.remove('btn-primary')); s.classList.add('btn-primary'); updatePickChoice(); }
-    function updatePickChoice(){
-      const el = $('#pickChoice');
-      if(el) el.textContent = (window.__pickDay ? DAY_NAMES[DAY_IDS.indexOf(window.__pickDay)] : '') + (window.__pickSlot ? ', ' + SLOT_NAMES[SLOT_IDS.indexOf(window.__pickSlot)].toLowerCase() : '');
-    }
+    if(d){ window.__pickDay = d.dataset.day; $$('.day-pick').forEach(x => x.classList.remove('btn-primary')); d.classList.add('btn-primary'); }
+    if(s){ window.__pickSlot = s.dataset.slot; $$('.slot-pick').forEach(x => x.classList.remove('btn-primary')); s.classList.add('btn-primary'); }
+    if(d || s) updatePickChoice();
   });
+  updatePickChoice();
 }
 
 /* ---------- МЕНЮ ---------- */
+function todayDayId(){ return ['sun','mon','tue','wed','thu','fri','sat'][new Date().getDay()]; }
+function menuHasDish(day, num){
+  const ds = S.menu[day];
+  if(!ds || !ds.slots) return false;
+  return SLOT_IDS.some(sl => (ds.slots[sl]||[]).some(e => e && e.t === 'r' && e.n === num));
+}
+/* добавить блюдо в приём пищи: если оно там уже есть - растёт количество,
+   дубликаты не создаются; возвращает существующую запись или null */
+function addDishToSlot(day, slot, dish){
+  const ds = dayState(day);
+  if(!ds.slots[slot]) ds.slots[slot] = [];
+  const twin = ds.slots[slot].find(x => x.t === dish.t && (dish.t === 'c' ? x.name === dish.name : x.n === dish.n));
+  if(twin) return stackDishes(twin, dish);
+  ds.slots[slot].push(JSON.parse(JSON.stringify(dish)));
+  return null;
+}
 function dayState(d){
   if(!S.menu[d]) S.menu[d] = {type: d === 'sun' ? 'sun' : 'norm', slots: {b:[],l:[],d:[],x:[]}};
   if(!S.menu[d].slots) S.menu[d].slots = {b:[],l:[],d:[],x:[]};
@@ -857,7 +903,7 @@ function dishBuyBadge(r){
 }
 function renderMenu(){
   const TT = targets();
-  const TODAY = ['sun','mon','tue','wed','thu','fri','sat'][new Date().getDay()];
+  const TODAY = todayDayId();
   $('#menuSub').textContent = 'Сегодня ' + new Date().toLocaleDateString('ru-RU', {weekday:'long', day:'numeric', month:'long'}) + '. Собери приёмы пищи на неделю - калории и БЖУ посчитаются против целей. Цели правятся в настройках: обычный день ' + fmtN(TT.norm.k) + ' ккал (Б ' + fmtN(TT.norm.p) + ' / Ж ' + fmtN(TT.norm.f) + ' / У ' + fmtN(TT.norm.c) + '), воскресенье ' + fmtN(TT.sun.k) + ' ккал (Б ' + fmtN(TT.sun.p) + ' / Ж ' + fmtN(TT.sun.f) + ' / У ' + fmtN(TT.sun.c) + ').';
   let weekK = 0;
   const html = DAY_IDS.map((d, di) => {
@@ -1618,8 +1664,14 @@ document.addEventListener('click', e => {
       const n = el.dataset.num;
       const panel = el.closest('.panel[data-recipe]');
       const mp = panel && MODAL_PORT && MODAL_PORT.num === n ? MODAL_PORT.p : null;
-      closeAllModals();
-      openSlotChooser(n, mp);
+      openSlotChooser(n, mp, 'any');
+      break;
+    }
+    case 'to-menu-today': {
+      const n = el.dataset.num;
+      const panel = el.closest('.panel[data-recipe]');
+      const mp = panel && MODAL_PORT && MODAL_PORT.num === n ? MODAL_PORT.p : null;
+      openSlotChooser(n, mp, 'today');
       break;
     }
     case 'add-recipe': closeAllModals(); openEditor(null); break;
@@ -1690,12 +1742,18 @@ document.addEventListener('click', e => {
     case 'pick-day': case 'pick-slot': break;
     case 'pick-confirm': {
       const n = el.dataset.num;
-      if(!window.__pickDay || !window.__pickSlot){ toast('Выбери день и приём пищи'); break; }
+      if(!window.__pickDay || !window.__pickSlot){ toast('Выбери приём пищи'); break; }
       const pp = el.dataset.p ? parseFloat(String(el.dataset.p).replace(',', '.')) || 1 : 1;
-      dayState(window.__pickDay).slots[window.__pickSlot].push({t:'r', n: n, p: pp});
+      const sl = window.__pickSlot;
+      const day = window.__pickDay;
+      const wasThere = (dayState(day).slots[sl]||[]).some(x => x && x.t === 'r' && x.n === n);
+      const twin = addDishToSlot(day, sl, {t:'r', n: n, p: pp});
       save(); renderNav();
-      closeAllModals();
-      toast(n + (pp !== 1 ? ' (' + pp + NBSP + pluralPort(pp) + ')' : '') + ' добавлено в меню на ' + DAY_NAMES[DAY_IDS.indexOf(window.__pickDay)]);
+      closeModal();
+      refreshModalFav(n);
+      const where = DAY_NAMES[DAY_IDS.indexOf(day)] + ', ' + SLOT_NAMES[SLOT_IDS.indexOf(sl)].toLowerCase();
+      if(wasThere) toast(n + ' уже было в меню - порция стала ' + NBSP + (twin ? (twin.p||1) : pp) + NBSP + '(' + where + ')');
+      else toast(n + (pp !== 1 ? ' (' + pp + NBSP + pluralPort(pp) + ')' : '') + ' добавлено: ' + where);
       if(currentView() === 'menu') renderMenu();
       break;
     }
@@ -1717,9 +1775,10 @@ document.addEventListener('click', e => {
       const name = cleanDash($('#pk-name').value.trim());
       if(!name){ toast('Введи название'); break; }
       const dish = {t:'c', name: name, kcal: numOf($('#pk-k').value), b: numOf($('#pk-b').value), f: numOf($('#pk-f').value), c: numOf($('#pk-c').value), qty: 1};
-      dayState(PICK_CTX.day).slots[PICK_CTX.slot].push(dish);
+      const twin = addDishToSlot(PICK_CTX.day, PICK_CTX.slot, dish);
       save(); renderNav();
-      toast('«' + dish.name + '» добавлено');
+      if(twin && twin.t === 'c') toast('«' + dish.name + '» уже было - количество стало ' + (twin.qty||1));
+      else toast('«' + dish.name + '» добавлено');
       $('#pk-name').value = ''; $('#pk-k').value = ''; $('#pk-b').value = ''; $('#pk-f').value = ''; $('#pk-c').value = '';
       if(currentView() === 'menu') renderMenu();
       break;
@@ -1727,10 +1786,11 @@ document.addEventListener('click', e => {
     case 'pick': {
       if(!PICK_CTX) break;
       const n = el.dataset.num;
-      dayState(PICK_CTX.day).slots[PICK_CTX.slot].push({t:'r', n: n, p:1});
+      addDishToSlot(PICK_CTX.day, PICK_CTX.slot, {t:'r', n: n, p:1});
       PICK_CTX.added[n] = true;
       save(); renderNav();
-      toast(n + ' добавлено');
+      const tot = ((dayState(PICK_CTX.day).slots[PICK_CTX.slot]||[]).filter(x => x.t === 'r' && x.n === n)).reduce((s,x) => s + (x.p||1), 0);
+      toast(n + ' добавлено' + (tot > 1 ? ' - всего ' + tot + NBSP + pluralPort(tot) + ' в этом приёме' : ''));
       renderPicker($('#pickSearch') ? $('#pickSearch').value : '');
       if(currentView() === 'menu') renderMenu();
       break;
@@ -1758,9 +1818,11 @@ document.addEventListener('click', e => {
       const arr = dayState(d).slots[sl];
       const dish = arr[i];
       if(!dish) break;
-      dayState(DAY_IDS[di + 1]).slots[sl].push(JSON.parse(JSON.stringify(dish)));
+      const twin = addDishToSlot(DAY_IDS[di + 1], sl, JSON.parse(JSON.stringify(dish)));
       save(); renderMenu(); renderNav();
-      toast('Скопировано на ' + DAY_NAMES[di + 1] + ' - готовь двойную порцию');
+      toast(twin
+        ? ('На ' + DAY_NAMES[di + 1] + ' это блюдо уже стояло - порция стала ' + NBSP + (twin.t === 'c' ? (twin.qty||1) : (twin.p||1)))
+        : ('Скопировано на ' + DAY_NAMES[di + 1] + ' - готовь двойную порцию'));
       break;
     }
     case 'dish-dec': case 'dish-inc': case 'dish-del': {
