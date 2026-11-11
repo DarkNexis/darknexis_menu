@@ -1,5 +1,5 @@
 /* Кулинарная книга: офлайн-кэш */
-const CACHE = 'ration-v45';
+const CACHE = 'ration-v46';
 const PRECACHE = ['./', './index.html', './manifest.webmanifest',
   './styles.css', './recipes.js', './config.js', './app.js',
   './icons/icon-192.png', './icons/icon-512.png',

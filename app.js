@@ -83,7 +83,7 @@ const SLOT_NAMES = DATA.slots.map(s => s[1]);
 const LS_KEY = 'cookbook-artem-v3';
 function defaultState(){
   return {
-    fav:{}, cooked:{}, stock:{}, menu:{}, shopCustom:[], shopExtra:[], shopDone:{}, openDays:{}, shopHide:{}, skipStock:true, customStock:[], cookLog:[],
+    fav:{}, cooked:{}, stock:{}, menu:{}, shopCustom:[], shopExtra:[], shopDone:{}, openDays:{}, shopHide:{}, skipStock:true, stockFilter:'all', customStock:[], cookLog:[],
     settings:{availSort:false, name:'', theme:'light'},
     recipes:null, customBooks:[], deletedNums:[], targets:null, seedVersion:null
   };
@@ -97,6 +97,7 @@ function migrateState(d){
   if(typeof d.skipStock !== 'boolean') d.skipStock = true;
   if(!Array.isArray(d.customStock)) d.customStock = [];
   if(!Array.isArray(d.cookLog)) d.cookLog = [];
+  if(['all','ok','low','out','unset'].indexOf(d.stockFilter) < 0) d.stockFilter = 'all';
   if(!('recipes' in d) || d.recipes === undefined) d.recipes = null;
   if(!('targets' in d) || d.targets === undefined) d.targets = null;
   if(!('seedVersion' in d)) d.seedVersion = null;
@@ -886,7 +887,7 @@ function dishHTML(dish, i, d, sl){
   }
   const kc = Math.round(r.kbju.k * (dish.p||1));
   return '<div class="dish">' +
-    '<div class="dish-top"><span class="num">'+r.num+'</span>' + dishBuyBadge(r) + '<span class="nm" title="'+esc(r.title)+'">'+esc(r.title)+'</span>' +
+    '<div class="dish-top"><button class="num" data-action="open" data-num="'+r.num+'" title="Открыть карточку рецепта">'+r.num+'</button>' + dishBuyBadge(r) + '<span class="nm" title="'+esc(r.title)+'">'+esc(r.title)+'</span>' +
     '<button class="x2btn" data-action="dish-x2" data-day="'+d+'" data-slot="'+sl+'" data-i="'+i+'" title="Поставить то же блюдо на следующий день">х2</button>' +
     '<button class="x2btn" data-action="dish-swap" data-day="'+d+'" data-slot="'+sl+'" data-i="'+i+'" title="Заменить другим блюдом из этой книги">'+I('dice',11)+'</button>' +
     '<button class="del" data-action="dish-del" data-day="'+d+'" data-slot="'+sl+'" data-i="'+i+'">'+I('x',12)+'</button></div>' +
@@ -899,7 +900,7 @@ function dishBuyBadge(r){
   const av = availInfo(r);
   if(!av.mapped || !av.missing) return '';
   const names = av.out.concat(av.low).join(', ');
-  return '<span class="buybadge" title="Нет или мало в запасах: ' + esc(names) + '">докупи' + NBSP + av.missing + '</span>';
+  return '<button class="buybadge" data-action="dish-buy" data-num="'+r.num+'" title="Нет или мало в запасах: ' + esc(names) + '. Нажми - добавлю список продуктов в покупки">докупи' + NBSP + av.missing + '</button>';
 }
 function renderMenu(){
   const TT = targets();
@@ -1162,11 +1163,63 @@ function renderShopNote(stockHidden){
   $('#shopNote').innerHTML = note + (extra.length ? '<br>' + extra.join('<br>') : '');
 }
 
+/* добавление карточки рецепта в покупки.
+   confirmAllHave() проверяет запасы: если у рецепта все привязанные продукты
+   в статусе «есть» - сначала показываем вопрос, и только после подтверждения
+   добавляем. Возвращает true, если был показан вопрос (или рецепт неизвестен). */
+function finishAddToShop(num, mp){
+  const base = (REC_BY_NUM[num] && REC_BY_NUM[num].portionsBase) || 1;
+  S.shopExtra.push(mp && mp !== base ? {num: num, p: mp} : {num: num});
+  save();
+  refreshModalFav(num);
+  renderNav();
+  if(currentView() === 'shop') renderShop();
+  toast('Ингредиенты ' + num + (mp && mp !== base ? ' на ' + mp + NBSP + pluralPort(mp) : '') + ' добавлены в список покупок');
+}
+function confirmAllHave(num, mp){
+  const r = REC_BY_NUM[num];
+  if(!r) return false;
+  const av = availInfo(r);
+  if(!(av.mapped > 0 && av.missing === 0)) return false;
+  const names = [];
+  for(const ing of r.ingredients){
+    const prod = DATA.ing2stock[ing.n] || (((S.customStock||[]).indexOf(ing.n) >= 0) ? ing.n : null);
+    if(prod) names.push(prod);
+  }
+  const uniq = Array.from(new Set(names));
+  const listTxt = uniq.length <= 6 ? uniq.join(', ') : uniq.slice(0,6).join(', ') + ' и ещё ' + (uniq.length - 6);
+  openModal('<div class="panel small" style="max-width:470px">' +
+    '<div class="panel-head"><div class="htxt"><div class="panel-title">Все продукты уже дома</div><div class="panel-sub"><b>'+esc(num)+'</b>'+DOT+esc(r.title)+'</div></div><button class="close-x" data-action="close">'+I('x',17)+'</button></div>' +
+    '<div class="panel-body" style="padding:14px 20px">' +
+      '<div class="set-hint" style="margin:0">По разделу «Запасы» у тебя уже есть все продукты для этого рецепта (' + esc(listTxt) + '). Добавить весь список продуктов в список покупок ещё раз?</div>' +
+      (S.skipStock ? '<div class="kbju-note" style="margin-top:9px">Сейчас в покупках включён режим «Запасы учтены»: строки с тем, что есть дома, из списка скрываются. Чтобы увидеть добавленное, нажми там кнопку «Без учёта запасов».</div>' : '') +
+    '</div>' +
+    '<div class="panel-foot"><button class="btn btn-ghost" data-action="close">Не добавлять</button><button class="btn btn-primary" data-action="shop-confirm-add" data-num="'+esc(num)+'" data-p="'+(mp||'')+'" style="margin-left:auto">Добавить всё равно</button></div></div>', {center:true});
+  return true;
+}
+
 /* ---------- ЗАПАСЫ ---------- */
+/* фильтр списка: 'all' - все, 'ok' - только есть, 'low' - мало, 'out' - нет,
+   'unset' - не отмечено; выбор сохраняется в localStorage (S.stockFilter) */
+function stkChip(v, label, n, color){
+  return '<button class="stk-chip'+(S.stockFilter === v ? ' on' : '')+'" data-action="stock-filter" data-v="'+v+'" title="Показать только: '+label.toLowerCase()+'">'+
+    (color ? '<span class="dot" style="background:'+color+'"></span>' : '') + label + '<span class="n">'+n+'</span></button>';
+}
 function renderStock(){
   const q = ($('#stockSearch').value || '').toLowerCase();
   $('#addStockBtn').innerHTML = I('plus',15) + 'Добавить';
   const allProds = DATA.stock.concat((S.customStock || []).map(n => ({name:n, cat:'Мои продукты', pack:'', freq:''})));
+  if(['all','ok','low','out','unset'].indexOf(S.stockFilter) < 0) S.stockFilter = 'all';
+  const cnt = {ok:0, low:0, out:0, unset:0};
+  allProds.forEach(p => { const st = S.stock[p.name]; if(st && cnt[st] !== undefined) cnt[st]++; else if(!st) cnt.unset++; });
+  const flt = S.stockFilter;
+  const matchSt = st => flt === 'all' ? true : (flt === 'unset' ? !st : st === flt);
+  $('#stockStats').innerHTML =
+    stkChip('all', 'Все', allProds.length, null) +
+    stkChip('ok', 'Есть', cnt.ok, 'var(--ok)') +
+    stkChip('low', 'Мало', cnt.low, 'var(--warn)') +
+    stkChip('out', 'Нет', cnt.out, 'var(--bad)') +
+    stkChip('unset', 'Не отмечено', cnt.unset, 'var(--muted)');
   const cats = new Map();
   allProds.forEach(p => {
     if(!cats.has(p.cat)) cats.set(p.cat, []);
@@ -1175,7 +1228,7 @@ function renderStock(){
   let h = '';
   let shown = 0;
   cats.forEach((prods, cat) => {
-    const rows = prods.filter(p => !q || (p.name + ' ' + p.cat).toLowerCase().includes(q));
+    const rows = prods.filter(p => matchSt(S.stock[p.name]) && (!q || (p.name + ' ' + p.cat).toLowerCase().includes(q)));
     if(!rows.length) return;
     shown += rows.length;
     h += '<div class="stock-group"><div class="stock-ghead">'+esc(cat)+'</div>';
@@ -1192,14 +1245,8 @@ function renderStock(){
     }).join('');
     h += '</div>';
   });
-  if(!shown) h = '<div class="empty"><div class="big">📦</div><div class="t serif">Продукт не найден</div></div>';
+  if(!shown) h = '<div class="empty"><div class="big">📦</div><div class="t serif">'+(q ? 'Продукт не найден' : 'В этом фильтре пусто')+'</div><p>'+(q ? 'Попробуй другое слово - или добавь свой продукт кнопкой ниже.' : 'Нажми «Все», чтобы увидеть весь каталог запасов.')+'</p></div>';
   $('#stockList').innerHTML = h;
-  const cnt = {ok:0, low:0, out:0};
-  Object.values(S.stock).forEach(v => { if(cnt[v] !== undefined) cnt[v]++; });
-  $('#stockStats').innerHTML =
-    '<span style="color:var(--ok)"><span class="dot" style="background:var(--ok)"></span>есть '+cnt.ok+'</span>' +
-    '<span style="color:var(--warn)"><span class="dot" style="background:var(--warn)"></span>мало '+cnt.low+'</span>' +
-    '<span style="color:var(--bad)"><span class="dot" style="background:var(--bad)"></span>нет '+cnt.out+'</span>';
   $('#copyStockBtn').innerHTML = I('copy',15) + 'Скопировать отчёт';
   $('#dataBtn').innerHTML = I('settings',15) + 'Настройки';
 }
@@ -1493,6 +1540,7 @@ function menuReport(){
 
 /* ---------- СТАТИСТИКА ГОТОВОК ---------- */
 let CAL_M = null;
+let CAL_SEL = null; /* выбранный день календаря (ISO) - под ним показывается список блюд */
 function todayISO(){
   const t = new Date();
   return t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0') + '-' + String(t.getDate()).padStart(2, '0');
@@ -1512,6 +1560,13 @@ function openStats(){
     '<div class="panel-body" style="padding:16px 20px 20px" id="statBody"></div></div>');
   renderStats();
 }
+function pluralCook(n){ return (n % 10 === 1 && n % 100 !== 11) ? 'готовка' : ((n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20)) ? 'готовки' : 'готовок'); }
+/* строка блюда для статистики: если рецепт существует - вся строка кликабельна и открывает карточку */
+function statDishRow(inner, num){
+  const r = num ? REC_BY_NUM[num] : null;
+  return '<div class="stat-row'+(r ? ' clickable' : '')+'"'+(r ? ' data-action="open" data-num="'+num+'" title="Открыть карточку рецепта"' : '') + '>' + inner + (r ? '<span class="chev">'+I('chev',13)+'</span>' : '') + '</div>';
+}
+function dishTT(num, name){ return '<b>'+esc(num)+'</b> '+esc(name); }
 function renderStats(){
   const body = $('#statBody'); if(!body) return;
   const map = logByDate();
@@ -1528,12 +1583,17 @@ function renderStats(){
     const recs = map[iso] || [];
     monthCnt += recs.length;
     const tip = recs.length ? recs.map(x => REC_BY_NUM[x.n] ? REC_BY_NUM[x.n].title : x.n).join('; ') : '';
-    cells += '<span class="cal-cell'+(recs.length ? ' has' : '')+(iso === todayIso ? ' today' : '')+'" title="'+esc(tip)+'">'+dd +
-      (recs.length ? '<span class="cal-dots">'+recs.slice(0,3).map(() => '<span></span>').join('')+'</span>' : '')+'</span>';
+    if(recs.length){
+      cells += '<button class="cal-cell has'+(iso === CAL_SEL ? ' sel' : '')+(iso === todayIso ? ' today' : '')+'" data-action="cal-day" data-iso="'+iso+'" title="'+esc(tip)+DOT+'нажми - покажу список">';
+    } else {
+      cells += '<span class="cal-cell'+(iso === todayIso ? ' today' : '')+'" title="'+esc(tip)+'">';
+    }
+    cells += dd + (recs.length ? '<span class="cal-dots">'+recs.slice(0,3).map(() => '<span></span>').join('')+'</span>' : '');
+    cells += recs.length ? '</button>' : '</span>';
   }
   const log = (S.cookLog || []).slice().sort((a,b) => b.d.localeCompare(a.d)).slice(0, 10);
   const top = Object.keys(S.cooked).filter(n => REC_BY_NUM[n]).sort((a,b) => (S.cooked[b]||0) - (S.cooked[a]||0)).slice(0, 6);
-  body.innerHTML =
+  let html =
     '<div class="cal-head">' +
       '<button class="cal-nav" data-action="cal-prev" aria-label="Предыдущий месяц" style="transform:rotate(90deg)">'+I('chev',15)+'</button>' +
       '<span class="cal-title">'+MON_FULL[CAL_M.m] + ' ' + CAL_M.y+'</span>' +
@@ -1541,14 +1601,31 @@ function renderStats(){
       '<span class="cal-sum">'+(monthCnt ? 'готовок: ' + monthCnt : 'готовок не было')+'</span>' +
     '</div>' +
     '<div class="cal-grid">'+cells+'</div>' +
+    '<div class="cal-hint">Дни с точками кликабельны: нажми на дату - покажу, что в этот день готовилось.</div>';
+  if(CAL_SEL){
+    const recs = map[CAL_SEL] || [];
+    const p = CAL_SEL.split('-');
+    const dt = new Date(+p[0], +p[1] - 1, +p[2]);
+    const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+    html += '<div class="day-cooks"><div class="dc-head">'+cap(dt.toLocaleDateString('ru-RU', {weekday:'long', day:'numeric', month:'long'})) + DOT + (recs.length ? pluralCook(recs.length) : 'готовок не было') + '</div>' +
+      (recs.length ? recs.map(e => {
+        const r = REC_BY_NUM[e.n];
+        return statDishRow('<span class="tt">'+(r ? dishTT(e.n, r.title) : esc(e.n))+'</span>', e.n);
+      }).join('') : '<div class="ed-hint">В этот день ничего не отмечено кнопкой «Я готовил». Выбери другой день в календаре.</div>') + '</div>';
+  }
+  html +=
     '<div class="sect-h" style="margin-top:16px">Последние приготовления</div>' +
     (log.length ? log.map(e => {
       const r = REC_BY_NUM[e.n];
       const dd = e.d.split('-');
-      return '<div class="stat-row"><span class="dt">'+(+dd[2])+' '+MON_SHORT[(+dd[1])-1]+'</span><span class="tt">'+(r ? '<b>'+e.n+'</b> '+esc(r.title) : esc(e.n))+'</span></div>';
+      return statDishRow('<span class="dt">'+(+dd[2])+' '+MON_SHORT[(+dd[1])-1]+'</span><span class="tt">'+(r ? dishTT(e.n, r.title) : esc(e.n))+'</span>', e.n);
     }).join('') : '<div class="ed-hint">Пока пусто: нажми «Я готовил» в карточке блюда - день появится в календаре.</div>') +
     '<div class="sect-h" style="margin-top:16px">Топ блюд</div>' +
-    (top.length ? top.map((n, i) => '<div class="stat-row"><span class="dt">'+(i+1)+'.</span><span class="tt"><b>'+n+'</b> '+esc(REC_BY_NUM[n].title)+'</span><span class="tc">'+(S.cooked[n]||0)+' раз</span></div>').join('') : '<div class="ed-hint">Счётчики ещё пустые.</div>');
+    (top.length ? top.map((n, i) => {
+      const r = REC_BY_NUM[n];
+      return statDishRow('<span class="dt">'+(i+1)+'.</span><span class="tt">'+dishTT(n, r.title)+'</span><span class="tc">'+(S.cooked[n]||0)+' раз</span>', n);
+    }).join('') : '<div class="ed-hint">Счётчики ещё пустые.</div>');
+  body.innerHTML = html;
 }
 
 /* ---------- события ---------- */
@@ -1559,8 +1636,9 @@ document.addEventListener('click', e => {
   switch(a){
     case 'go': e.stopPropagation(); go(el.dataset.view); break;
     case 'open-stats': openStats(); break;
-    case 'cal-prev': { CAL_M.m--; if(CAL_M.m < 0){ CAL_M.m = 11; CAL_M.y--; } renderStats(); break; }
-    case 'cal-next': { CAL_M.m++; if(CAL_M.m > 11){ CAL_M.m = 0; CAL_M.y++; } renderStats(); break; }
+    case 'cal-prev': { CAL_M.m--; if(CAL_M.m < 0){ CAL_M.m = 11; CAL_M.y--; } CAL_SEL = null; renderStats(); break; }
+    case 'cal-next': { CAL_M.m++; if(CAL_M.m > 11){ CAL_M.m = 0; CAL_M.y++; } CAL_SEL = null; renderStats(); break; }
+    case 'cal-day': { CAL_SEL = (CAL_SEL === el.dataset.iso) ? null : el.dataset.iso; renderStats(); break; }
     case 'toggle-search': {
       const sb = $('#searchbar');
       sb.classList.toggle('open');
@@ -1646,18 +1724,32 @@ document.addEventListener('click', e => {
       const n = el.dataset.num;
       if(!tapGuard('shop:'+n)) break;
       const idx = S.shopExtra.findIndex(x => x.num === n);
-      if(idx < 0){
-        const panel = el.closest('.panel[data-recipe]');
-        const mp = panel && MODAL_PORT && MODAL_PORT.num === n ? MODAL_PORT.p : null;
-        const base = (REC_BY_NUM[n] && REC_BY_NUM[n].portionsBase) || 1;
-        S.shopExtra.push(mp && mp !== base ? {num: n, p: mp} : {num: n});
-        toast('Ингредиенты ' + n + (mp && mp !== base ? ' на ' + mp + NBSP + pluralPort(mp) : '') + ' добавлены в список покупок');
+      if(idx >= 0){
+        S.shopExtra = S.shopExtra.filter(x => x.num !== n);
+        toast('Карточка ' + n + ' убрана из покупок');
+        save();
+        refreshModalFav(n);
+        renderNav();
+        if(currentView() === 'shop') renderShop();
+        break;
       }
-      else { S.shopExtra = S.shopExtra.filter(x => x.num !== n); toast('Карточка ' + n + ' убрана из покупок'); }
-      save();
-      refreshModalFav(n);
-      renderNav();
-      if(currentView() === 'shop') renderShop();
+      const panel = el.closest('.panel[data-recipe]');
+      const mp = panel && MODAL_PORT && MODAL_PORT.num === n ? MODAL_PORT.p : null;
+      if(!confirmAllHave(n, mp)) finishAddToShop(n, mp);
+      break;
+    }
+    case 'shop-confirm-add': {
+      const n = el.dataset.num;
+      const mp = el.dataset.p ? parseFloat(String(el.dataset.p).replace(',', '.')) : null;
+      closeModal(); /* закрываем только вопрос - карточка рецепта остаётся открытой */
+      finishAddToShop(n, (mp && !isNaN(mp)) ? mp : null);
+      break;
+    }
+    case 'dish-buy': { /* бейдж «докупи N» в меню: добавить недостающее в покупки */
+      e.stopPropagation();
+      const n = el.dataset.num;
+      if(!tapGuard('buy:'+n)) break;
+      if(!confirmAllHave(n, null)) finishAddToShop(n, null);
       break;
     }
     case 'to-menu': {
@@ -1962,6 +2054,11 @@ document.addEventListener('click', e => {
       ta.value = lines.join('\n');
       ta.focus();
       if(ta.setSelectionRange){ const pp = ta.value.length; ta.setSelectionRange(pp, pp); }
+      break;
+    }
+    case 'stock-filter': {
+      S.stockFilter = el.dataset.v || 'all';
+      save(); renderStock();
       break;
     }
     case 'stock-set': {
